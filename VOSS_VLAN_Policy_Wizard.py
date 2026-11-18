@@ -6,7 +6,7 @@
 # Engine   : ExtremeCloud IQ Site Engine / XMC Python
 # ACL type : inVlan - ACL ID = VLAN ID
 # Author   : Ozan AKMUSTAFAOGLU
-# Revision : 4.0
+# Revision : 4.1
 # Date     : November 2026
 #
 # WHAT IT DOES
@@ -31,6 +31,8 @@
 #
 # FIELD FORMATS
 #   VLAN list           12  |  12,15,18  |  20-25  |  ALL
+#   Source Host/Subnet  10.30.6.100  |  10.30.6.0/25 - limits the rule to
+#                       part of the source instead of the whole source
 #   Destination Subnet  10.10.13.0/24  |  10.10.13.50  - overrides Dest VLAN
 #   Ports               tcp:443 tcp:3389 udp:53 icmp  - empty means all
 #   Excluded VLANs      VLANs never touched by ALL - FW transit, MGMT
@@ -38,15 +40,21 @@
 #
 # RULE ORDER - first match wins
 #   ACE 1-99      OWN_...  own subnet, always permitted first
-#   ACE 100-899   ALW_...  allow rules
-#   ACE 1000-1999 DNY_...  deny rules
+#   ACE 100-899   ALW_ A_  allow rules and R_ automatic return rules
+#   ACE 1000-1999 DNY_ D_  deny rules
 #   default-action permit  everything else, including internet
 #   Rules are recognised by name. Existing rules are never duplicated and
 #   ACEs not created by this wizard are never modified.
 #
+# RETURN TRAFFIC
+#   ACLs are stateless. When a port-limited allow from A to B is blocked on
+#   the way back by a deny on B, the wizard adds a return rule on B that
+#   permits only the replies - same port as source port. Return rules are
+#   added and removed automatically on every run.
+#
 # NOTES
-#   - ACLs are stateless. A deny from A to B also breaks connections that
-#     B starts toward A, because the replies are dropped on A.
+#   - A deny from A to B also breaks connections that B starts toward A,
+#     because the replies are dropped on A.
 #   - A port ACL takes precedence over a VLAN ACL on the same port.
 #   - Verify syntax on your VOSS release. Start with Show_Report and Dry Run.
 ###############################################################################
@@ -70,6 +78,12 @@ set var aclAction Show_Report
 #  scope = global
 #  )
 set var aclSrcVlan ALL
+#@VariableFieldLabel (description = "Source Host/Subnet - optional CIDR or host IP",
+#  type = String,
+#  required = no,
+#  scope = global
+#  )
+set var aclSrcSubnet none
 #@VariableFieldLabel (description = "Destination VLAN - e.g. 13 or 1 or ALL",
 #  type = String,
 #  required = no,
@@ -128,7 +142,7 @@ SRC_VAR = "aclSrcVlan"
 
 import re
 
-VERSION = "4.0"
+VERSION = "4.1"
 AUTHOR = "Ozan AKMUSTAFAOGLU"
 
 OWN_RANGE = (1, 99)
@@ -138,10 +152,15 @@ PORT_ACL_POOL = (1500, 1799)
 ISID_ACL_POOL = (1800, 2047)
 LINE = "=" * 78
 SUB = "-" * 78
-RULE_RE = re.compile(r"^(ALW|DNY)_(V\d+|S\d+_\d+_\d+_\d+_\d+)(?:_(TCP\d+|UDP\d+|ICMP))?$")
 TITLES = {"VLAN": "VOSS Inter-VLAN Access Policy Wizard",
           "PORT": "VOSS Port Access Policy Wizard",
           "ISID": "VOSS I-SID Access Policy Wizard"}
+
+# v3/v4 rule names : ALW_V13_TCP443   DNY_S10_10_13_0_24
+OLD_RE = re.compile(r"^(ALW|DNY)_(V\d+|S\d+_\d+_\d+_\d+_\d+)(?:_(TCP\d+|UDP\d+|ICMP))?$")
+# v4.1 rule names: A_<src>_<dst>_<port>  D_<src>_<dst>  R_<remote>_<local>_<port>
+CODE = r"(?:V\d+|H[0-9A-F]{8}|N[0-9A-F]{10})"
+NEW_RE = re.compile(r"^([ADR])_(%s)_(%s)(?:_(T\d+|U\d+|I))?$" % (CODE, CODE))
 
 
 def out(s=""):
@@ -204,12 +223,14 @@ def network_of(ip, mask):
 
 
 def cidr(net, mask):
-    return "%s/%d" % (net, mask2prefix(mask))
+    p = mask2prefix(mask)
+    return net if p == 32 else "%s/%d" % (net, p)
 
 
-def contains(outer_net, outer_mask, inner_net, inner_mask):
-    return (mask2prefix(outer_mask) <= mask2prefix(inner_mask)
-            and (ip2int(inner_net) & ip2int(outer_mask)) == ip2int(outer_net))
+def contains(outer, inner):
+    """outer, inner = (net, mask)"""
+    return (mask2prefix(outer[1]) <= mask2prefix(inner[1])
+            and (ip2int(inner[0]) & ip2int(outer[1])) == ip2int(outer[0]))
 
 
 ###############################################################################
@@ -277,7 +298,6 @@ def parse_port_list(text, field):
 
 
 def expand_port_text(text):
-    """Running-config port list '1/5,1/7-1/9' -> set of ports. Best effort."""
     res = set()
     for tok in re.split(r"[,\s]+", text.strip()):
         m = re.match(r"^(\d+(?:/\d+)?)/(\d+)(?:-(?:\d+(?:/\d+)?/)?(\d+))?$", tok)
@@ -289,20 +309,20 @@ def expand_port_text(text):
     return res
 
 
-def parse_subnet(text):
+def parse_subnet(text, field):
     text = text.strip()
     m = re.match(r"^(%s)(?:/(\d+))?$" % IP_RE, text)
     if not m:
-        raise InputError("Destination Subnet: cannot parse '%s' - e.g. 10.10.13.0/24" % text)
+        raise InputError("%s: cannot parse '%s' - e.g. 10.10.13.0/24 or 10.10.13.50" % (field, text))
     prefix = int(m.group(2)) if m.group(2) else 32
     if prefix > 32:
-        raise InputError("Destination Subnet: invalid prefix /%d" % prefix)
+        raise InputError("%s: invalid prefix /%d" % (field, prefix))
     mask = prefix2mask(prefix)
     return network_of(m.group(1), mask), mask
 
 
 def parse_ports(text):
-    """'' -> [None] meaning all traffic; 'tcp:443 icmp' -> [('tcp','443'),('icmp',None)]"""
+    """'' -> [None] = all traffic;  'tcp:443 icmp' -> [('tcp','443'),('icmp',None)]"""
     text = (text or "").strip()
     if not text or text.lower() == "any":
         return [None]
@@ -335,10 +355,34 @@ def parse_override(text):
     return res
 
 
+# ports: tuple ('tcp','443')  <->  label 'TCP443'  <->  code 'T443'
+
 def port_label(p):
     if p is None:
         return ""
     return p[0].upper() if p[1] is None else "%s%s" % (p[0].upper(), p[1])
+
+
+def port_code(p):
+    if p is None:
+        return ""
+    return p[0][0].upper() + (p[1] or "")
+
+
+def label_to_port(label):
+    if not label:
+        return None
+    if label == "ICMP":
+        return ("icmp", None)
+    return (label[:3].lower(), label[3:])
+
+
+def code_to_label(c):
+    if not c:
+        return ""
+    if c == "I":
+        return "ICMP"
+    return {"T": "TCP", "U": "UDP"}[c[0]] + c[1:]
 
 
 def compress(nums):
@@ -357,36 +401,102 @@ def compress(nums):
 
 
 ###############################################################################
-# Destinations and rule names
+# Network objects and rule names
 ###############################################################################
 
-class Dest(object):
-    def __init__(self, key, net, mask, vlan=None):
-        self.key, self.net, self.mask, self.vlan = key, net, mask, vlan
+class Net(object):
+    """A VLAN, a subnet or a host used as source or destination of a rule."""
+
+    def __init__(self, net, mask, vlan=None):
+        self.net, self.mask, self.vlan = net, mask, vlan
+
+    @property
+    def nm(self):
+        return (self.net, self.mask)
+
+    @property
+    def code(self):
+        if self.vlan is not None:
+            return "V%d" % self.vlan
+        p = mask2prefix(self.mask)
+        h = "%08X" % ip2int(self.net)
+        return ("H" + h) if p == 32 else ("N%s%02X" % (h, p))
+
+    @property
+    def key(self):
+        """v3/v4 compatible destination key"""
+        if self.vlan is not None:
+            return "V%d" % self.vlan
+        return "S%s_%d" % (self.net.replace(".", "_"), mask2prefix(self.mask))
+
+    def ident(self):
+        return ("V", self.vlan) if self.vlan is not None else ("N", self.net, mask2prefix(self.mask))
 
     def label(self):
         return ("VLAN %d" % self.vlan) if self.vlan is not None else cidr(self.net, self.mask)
 
 
-def dest_vlan(vlan, subnets):
+def net_vlan(vlan, subnets):
     net, mask = subnets[vlan]
-    return Dest("V%d" % vlan, net, mask, vlan)
+    return Net(net, mask, vlan)
 
 
-def dest_subnet(net, mask):
-    return Dest("S%s_%d" % (net.replace(".", "_"), mask2prefix(mask)), net, mask)
+def decode(code, subnets):
+    """Rule code or v3/v4 key -> Net, or None when a VLAN subnet is unknown."""
+    if code.startswith("V"):
+        v = int(code[1:])
+        return net_vlan(v, subnets) if v in subnets else None
+    if code.startswith("H"):
+        return Net(int2ip(int(code[1:9], 16)), "255.255.255.255")
+    if code.startswith("N"):
+        return Net(int2ip(int(code[1:9], 16)), prefix2mask(int(code[9:11], 16)))
+    p = code[1:].split("_")
+    return Net(".".join(p[:4]), prefix2mask(int(p[4])))
 
 
-def key_to_text(key):
-    if key.startswith("V"):
-        return "VLAN " + key[1:]
-    p = key[1:].split("_")
-    return "%s/%s" % (".".join(p[:4]), p[4])
+def code_text(code, subnets):
+    if code.startswith("V"):
+        return "VLAN " + code[1:]
+    n = decode(code, subnets)
+    return n.label() if n else code
 
 
-def rule_name(kind, dest, port):
-    n = "%s_%s" % (kind, dest.key)
-    return n + ("_" + port_label(port) if port else "")
+def ident_of(code):
+    if code.startswith("V"):
+        return ("V", int(code[1:]))
+    n = decode(code, {})
+    return ("N", n.net, mask2prefix(n.mask))
+
+
+def rule_name(kind, src, dst, port):
+    """kind ALW / DNY. Without source keeps the v3/v4 format."""
+    if src is None:
+        return "%s_%s" % (kind, dst.key) + ("_" + port_label(port) if port else "")
+    return "%s_%s_%s" % (kind[0], src.code, dst.code) + ("_" + port_code(port) if port else "")
+
+
+def return_name(remote, local, port):
+    return "R_%s_%s_%s" % (remote.code, local.code, port_code(port))
+
+
+class Rule(object):
+    def __init__(self, ace, kind, src, dst, plabel):
+        self.ace, self.kind, self.src, self.dst, self.plabel = ace, kind, src, dst, plabel
+
+
+def parse_rule(ace, name):
+    m = OLD_RE.match(name)
+    if m:
+        return Rule(ace, m.group(1), None, m.group(2), m.group(3) or "")
+    m = NEW_RE.match(name)
+    if m:
+        kind = {"A": "ALW", "D": "DNY", "R": "RET"}[m.group(1)]
+        return Rule(ace, kind, m.group(2), m.group(3), code_to_label(m.group(4) or ""))
+    return None
+
+
+def is_own(name):
+    return name == "OWN_SUBNET" or name.startswith("OWN_")
 
 
 ###############################################################################
@@ -451,9 +561,6 @@ def discover_isids():
 class FilterState(object):
     def __init__(self, text):
         self.acls = set(int(x) for x in re.findall(r"^\s*filter acl (\d+) (?:enable|type|name)", text, re.M))
-        self.acl_type = {}
-        for a, t in re.findall(r"^\s*filter acl (\d+) type (\w+)", text, re.M):
-            self.acl_type[int(a)] = t
         self.vlan_to_acl = {}
         for a, v in re.findall(r"^\s*filter acl vlan (\d+) (\d+)", text, re.M):
             self.vlan_to_acl[int(v)] = int(a)
@@ -461,11 +568,9 @@ class FilterState(object):
         for a, i in re.findall(r"^\s*filter acl i-sid (\d+) (\d+)", text, re.M):
             self.isid_to_acl[int(i)] = int(a)
         self.port_to_acl = {}
-        self.acl_ports = {}
         for a, pl in re.findall(r"^\s*filter acl port (\d+) (\S+)", text, re.M):
             for p in expand_port_text(pl):
                 self.port_to_acl[p] = int(a)
-                self.acl_ports.setdefault(int(a), set()).add(p)
         self.aces = {}
         for a, e, n in re.findall(r'^\s*filter acl ace (\d+) (\d+) name "?([^"\r\n]+?)"?\s*$', text, re.M):
             self.aces.setdefault(int(a), {})[int(e)] = n.strip()
@@ -481,13 +586,12 @@ class FilterState(object):
         return None
 
     def rules(self, acl):
-        """[(ace, kind, key, portlabel)] for wizard rules"""
         res = []
-        for e, n in self.aces.get(acl, {}).items():
-            m = RULE_RE.match(n)
-            if m:
-                res.append((e, m.group(1), m.group(2), m.group(3) or ""))
-        return sorted(res)
+        for e, n in sorted(self.aces.get(acl, {}).items()):
+            r = parse_rule(e, n)
+            if r:
+                res.append(r)
+        return res
 
     def alloc(self, acl, rng):
         used = set(self.aces.get(acl, {}).keys()) | self.reserved.setdefault(acl, set())
@@ -519,8 +623,6 @@ def read_filter_config():
 ###############################################################################
 
 class Binding(object):
-    """kind VLAN / PORT / ISID. own = list of (name, Dest) always permitted first."""
-
     def __init__(self, kind, ident, own, title):
         self.kind, self.ident, self.own, self.title = kind, ident, own, title
 
@@ -555,17 +657,18 @@ class Binding(object):
     def unbind_cmd(self, acl):
         return "no " + self.bind_cmd(acl)
 
+    def _map(self, st):
+        return {"VLAN": st.vlan_to_acl, "PORT": st.port_to_acl, "ISID": st.isid_to_acl}[self.kind]
+
     def mark_bound(self, st, acl):
-        if self.kind == "VLAN":
-            st.vlan_to_acl[self.ident] = acl
-        elif self.kind == "PORT":
-            st.port_to_acl[self.ident] = acl
-            st.acl_ports.setdefault(acl, set()).add(self.ident)
-        else:
-            st.isid_to_acl[self.ident] = acl
+        self._map(st)[self.ident] = acl
+
+    def unmark(self, st, acl):
+        self._map(st).pop(self.ident, None)
+        st.acls.discard(acl)
+        st.aces.pop(acl, None)
 
     def other_users(self, st, acl):
-        """Other bindings that share this ACL - editing it would affect them."""
         res = []
         res += ["VLAN %d" % v for v, a in st.vlan_to_acl.items() if a == acl and not (self.kind == "VLAN" and v == self.ident)]
         res += ["port %s" % p for p, a in st.port_to_acl.items() if a == acl and not (self.kind == "PORT" and p == self.ident)]
@@ -577,25 +680,28 @@ class Binding(object):
 # Planner
 ###############################################################################
 
-def is_own(name):
-    return name == "OWN_SUBNET" or name.startswith("OWN_")
-
-
 class Planner(object):
-    def __init__(self, state, subnets):
+    def __init__(self, state, subnets, isids):
         self.st = state
         self.sn = subnets
+        self.isids = isids
         self.groups = []
 
-    def _ace(self, acl, name, action, dest, port, rng):
+    # --- low level
+    def _ace(self, acl, name, action, dst, port, rng, src=None, src_port=False):
+        if len(name) > 32:
+            raise InputError("Rule name too long for VOSS: %s" % name)
         ace = self.st.alloc(acl, rng)
         c = ['filter acl ace %d %d name %s' % (acl, ace, name),
-             'filter acl ace action %d %d %s count' % (acl, ace, action),
-             'filter acl ace ip %d %d dst-ip mask %s %s' % (acl, ace, dest.net, dest.mask)]
+             'filter acl ace action %d %d %s count' % (acl, ace, action)]
+        if src is not None:
+            c.append('filter acl ace ip %d %d src-ip mask %s %s' % (acl, ace, src.net, src.mask))
+        c.append('filter acl ace ip %d %d dst-ip mask %s %s' % (acl, ace, dst.net, dst.mask))
         if port:
             c.append('filter acl ace ip %d %d ip-protocol-type eq %s' % (acl, ace, port[0]))
             if port[1]:
-                c.append('filter acl ace protocol %d %d dst-port eq %s' % (acl, ace, port[1]))
+                c.append('filter acl ace protocol %d %d %s eq %s'
+                         % (acl, ace, "src-port" if src_port else "dst-port", port[1]))
         c.append('filter acl ace %d %d enable' % (acl, ace))
         self.st.aces.setdefault(acl, {})[ace] = name
         return c
@@ -624,65 +730,54 @@ class Planner(object):
                      'filter acl set %d default-action permit' % acl,
                      'filter acl %d enable' % acl]
             st.acls.add(acl)
-        for name, d in b.own:
+        for name, n in b.own:
             if st.find(acl, name) is None:
-                notes.append("Permit own subnet %s" % cidr(d.net, d.mask))
-                cmds += self._ace(acl, name, "permit", d, None, OWN_RANGE)
+                notes.append("Permit own subnet %s" % cidr(n.net, n.mask))
+                cmds += self._ace(acl, name, "permit", n, None, OWN_RANGE)
         if b.existing_acl(st) != acl:
             binds.append(b.bind_cmd(acl))
             b.mark_bound(st, acl)
             notes.append("Bind ACL %d to %s" % (acl, b.title))
         return acl
 
-    def _add_rules(self, acl, kind, dests, ports, notes, cmds):
+    # --- actions
+    def _add_rules(self, acl, kind, src, dests, ports, notes, cmds):
         action = "permit" if kind == "ALW" else "deny"
         rng = ALW_RANGE if kind == "ALW" else DNY_RANGE
+        src_code = src.code if src is not None else None
+        origins = [src] if src is not None else [n for name, n in self._own_of(acl)]
+        was_blocked = dict((d.ident(), any(self._blocked(acl, o, d) for o in origins)) for d in dests)
         added, skipped, cleaned = [], [], 0
         for d in dests:
-            full_name = rule_name(kind, d, None)
+            full_name = rule_name(kind, src, d, None)
             for p in ports:
-                name = rule_name(kind, d, p)
-                if len(name) > 32:
-                    raise InputError("Rule name too long for VOSS: %s" % name)
+                name = rule_name(kind, src, d, p)
                 if self.st.find(acl, name) is not None or (p and self.st.find(acl, full_name) is not None):
                     skipped.append((d, p))
                     continue
                 if p is None:
-                    for e, k, key, pl in self.st.rules(acl):
-                        if k == kind and key == d.key and pl:
-                            cmds += self._del(acl, e)
+                    for r in self.st.rules(acl):
+                        if (r.kind == kind and r.plabel and r.src == src_code
+                                and ident_of(r.dst) == d.ident()):
+                            cmds += self._del(acl, r.ace)
                             cleaned += 1
-                cmds += self._ace(acl, name, action, d, p, rng)
+                cmds += self._ace(acl, name, action, d, p, rng, src)
                 added.append((d, p))
         verb = "ALLOW" if kind == "ALW" else "DENY "
+        frm = ("from %s to " % src.label()) if src is not None else ""
         if added:
-            notes.append("%s %s" % (verb, summarize(added)))
+            notes.append("%s %s%s" % (verb, frm, summarize(added)))
         if skipped:
-            notes.append("Already in place: %s" % summarize(skipped))
+            notes.append("Already in place: %s%s" % (frm, summarize(skipped)))
         if cleaned:
             notes.append("Replaced %d port rule(s) with a full rule" % cleaned)
         if kind == "ALW" and added:
-            denies = [(key, pl) for e, k, key, pl in self.st.rules(acl) if k == "DNY"]
-            uncovered = [d for d, p in added if not self._covered(d, denies)]
+            uncovered = [d for d, p in added if not was_blocked[d.ident()]]
             if uncovered:
                 notes.append("Info: no deny rule covers %s - traffic was already permitted"
                              % ", ".join(sorted(set(d.label() for d in uncovered))))
 
-    def _covered(self, dest, denies):
-        for key, pl in denies:
-            if pl:
-                continue
-            if key.startswith("V"):
-                v = int(key[1:])
-                if v in self.sn and contains(self.sn[v][0], self.sn[v][1], dest.net, dest.mask):
-                    return True
-            else:
-                parts = key[1:].split("_")
-                if contains(".".join(parts[:4]), prefix2mask(int(parts[4])), dest.net, dest.mask):
-                    return True
-        return False
-
-    def _remove_rules(self, b, dests, ports, notes, cmds, unbinds):
+    def _remove_rules(self, b, src, dests, ports, notes, cmds, unbinds):
         acl = b.existing_acl(self.st)
         if acl is None:
             notes.append("No policy on %s - nothing to remove" % b.title)
@@ -690,35 +785,138 @@ class Planner(object):
         others = b.other_users(self.st, acl)
         if others:
             raise InputError("ACL %d is shared with %s - edit it manually" % (acl, ", ".join(others[:3])))
-        keys = None if dests is None else set(d.key for d in dests)
+        idents = None if dests is None else set(d.ident() for d in dests)
         labels = None if ports == [None] else set(port_label(p) for p in ports)
         removed = []
-        for e, k, key, pl in self.st.rules(acl):
-            if keys is not None and key not in keys:
+        for r in self.st.rules(acl):
+            if r.kind == "RET":
                 continue
-            if labels is not None and pl not in labels:
+            if src is not None and r.src != src.code:
                 continue
-            cmds += self._del(acl, e)
-            removed.append("%s_%s%s" % (k, key, "_" + pl if pl else ""))
+            if idents is not None and ident_of(r.dst) not in idents:
+                continue
+            if labels is not None and r.plabel not in labels:
+                continue
+            cmds += self._del(acl, r.ace)
+            removed.append(self.st_name(r))
         if removed:
             notes.append("REMOVE %d rule(s): %s" % (len(removed), shorten(removed)))
         else:
             notes.append("No matching rule found")
-        left = [n for n in self.st.aces.get(acl, {}).values() if not is_own(n)]
-        if not left:
+        names = self.st.aces.get(acl, {}).values()
+        left = [n for n in names if not is_own(n) and not (parse_rule(0, n) and parse_rule(0, n).kind == "RET")]
+        rets = [n for n in names if parse_rule(0, n) and parse_rule(0, n).kind == "RET"]
+        if not left and not rets:
             notes.append("ACL %d is now empty - unbind and delete" % acl)
             for e, n in sorted(self.st.aces.get(acl, {}).items()):
                 cmds += self._del(acl, e)
             unbinds += [b.unbind_cmd(acl), 'no filter acl %d' % acl]
+            b.unmark(self.st, acl)
+        elif not left:
+            notes.append("ACL %d kept - it holds %d return rule(s) for other VLANs" % (acl, len(rets)))
 
-    def add(self, b, action, dests, ports):
+    def st_name(self, r):
+        if r.src is None:
+            return "%s %s%s" % (r.kind, code_text(r.dst, self.sn), " " + r.plabel if r.plabel else "")
+        return "%s %s > %s%s" % (r.kind, code_text(r.src, self.sn), code_text(r.dst, self.sn),
+                                 " " + r.plabel if r.plabel else "")
+
+    def add(self, b, action, src, dests, ports):
         notes, cmds, binds, unbinds = [], [], [], []
         if action == "Remove_ACL":
-            self._remove_rules(b, dests, ports, notes, cmds, unbinds)
+            self._remove_rules(b, src, dests, ports, notes, cmds, unbinds)
         else:
             acl = self._ensure_acl(b, notes, cmds, binds)
-            self._add_rules(acl, "ALW" if action == "Allow_ACL" else "DNY", dests, ports, notes, cmds)
+            self._add_rules(acl, "ALW" if action == "Allow_ACL" else "DNY", src, dests, ports, notes, cmds)
         self.groups.append((b.title, notes, cmds + binds + unbinds))
+
+    # --- return traffic
+    def _own_of(self, acl):
+        """Origin subnets of an ACL: [(code, Net)]"""
+        st, res = self.st, []
+        for v, a in st.vlan_to_acl.items():
+            if a == acl and v in self.sn:
+                res.append(("V%d" % v, net_vlan(v, self.sn)))
+        for i, a in st.isid_to_acl.items():
+            v = self.isids.get(i)
+            if a == acl and v in self.sn:
+                res.append(("V%d" % v, net_vlan(v, self.sn)))
+        if any(a == acl for a in st.port_to_acl.values()):
+            for n in st.aces.get(acl, {}).values():
+                m = re.match(r"^OWN_V(\d+)$", n)
+                if m and int(m.group(1)) in self.sn:
+                    res.append(("V" + m.group(1), net_vlan(int(m.group(1)), self.sn)))
+        return res
+
+    def _blocked(self, acl, sender, target):
+        """Would traffic from sender to target be dropped by full rules of acl?"""
+        for r in self.st.rules(acl):
+            if r.plabel or r.kind == "RET":
+                continue
+            s = decode(r.src, self.sn) if r.src else None
+            d = decode(r.dst, self.sn)
+            if d is None or (s is not None and not contains(s.nm, sender.nm)):
+                continue
+            if contains(d.nm, target.nm):
+                return r.kind == "DNY"
+        return False
+
+    def _vlan_of(self, n):
+        if n.vlan is not None:
+            return n.vlan
+        best = None
+        for v, sn in self.sn.items():
+            if contains(sn, n.nm) and (best is None or mask2prefix(sn[1]) > mask2prefix(self.sn[best][1])):
+                best = v
+        return best
+
+    def reconcile_returns(self):
+        """Every port-limited allow whose replies are dropped by a deny on the far
+        side gets a return rule there. Return rules no longer needed are removed."""
+        st = self.st
+        desired, notes, warn = {}, [], set()
+        acls = set(st.vlan_to_acl.values()) | set(st.isid_to_acl.values()) | set(st.port_to_acl.values())
+        for acl in sorted(acls):
+            for r in st.rules(acl):
+                if r.kind != "ALW":
+                    continue
+                remote = decode(r.dst, self.sn)
+                if remote is None:
+                    continue
+                if r.src:
+                    origins = [decode(r.src, self.sn)]
+                else:
+                    origins = [n for c, n in self._own_of(acl)]
+                v_r = self._vlan_of(remote)
+                acl_r = st.vlan_to_acl.get(v_r)
+                if acl_r is None or acl_r == acl:
+                    continue
+                for o in origins:
+                    if o is None or not self._blocked(acl_r, remote, o):
+                        continue
+                    if not r.plabel:
+                        warn.add("ACL %d drops replies from %s to %s - allow specific ports instead"
+                                 % (acl_r, remote.label(), o.label()))
+                        continue
+                    port = label_to_port(r.plabel)
+                    desired[(acl_r, return_name(remote, o, port))] = (remote, o, port)
+        cmds = []
+        for acl in sorted(acls):
+            for r in st.rules(acl):
+                if r.kind == "RET":
+                    name = st.aces[acl][r.ace]
+                    if (acl, name) not in desired:
+                        cmds += self._del(acl, r.ace)
+                        notes.append("REMOVE return rule in ACL %d: %s > %s %s - no longer needed"
+                                     % (acl, code_text(r.src, self.sn), code_text(r.dst, self.sn), r.plabel))
+        for (acl_r, name), (remote, o, port) in sorted(desired.items()):
+            if st.find(acl_r, name) is None:
+                cmds += self._ace(acl_r, name, "permit", o, port, ALW_RANGE, remote, src_port=True)
+                notes.append("ADD return rule in ACL %d: replies %s %s > %s"
+                             % (acl_r, remote.label(), port_label(port), o.label()))
+        notes += ["Warning: " + w for w in sorted(warn)]
+        if notes:
+            self.groups.append(("Return traffic - stateless ACL replies", notes, cmds))
 
 
 def summarize(pairs):
@@ -742,36 +940,46 @@ def shorten(items, n=6):
 # Report
 ###############################################################################
 
-def fmt_rules(items, all_set):
-    if not items:
-        return "-"
-    full_v, ported, subs = [], {}, []
-    for key, pl in items:
-        if pl:
-            ported.setdefault(key, []).append(pl)
-        elif key.startswith("V"):
-            full_v.append(int(key[1:]))
+def fmt_cell(rules, kind, others, subnets):
+    full_v, ported, subs, scoped = [], {}, [], []
+    for r in rules:
+        if r.kind != kind:
+            continue
+        if r.src:
+            scoped.append("%s>%s%s" % (code_text(r.src, subnets), code_text(r.dst, subnets),
+                                       " " + r.plabel if r.plabel else ""))
+        elif r.plabel:
+            ported.setdefault(r.dst, []).append(r.plabel)
+        elif r.dst.startswith("V"):
+            full_v.append(int(r.dst[1:]))
         else:
-            subs.append(key)
+            subs.append(code_text(r.dst, subnets))
     parts = []
     if full_v:
-        if all_set and set(all_set) <= set(full_v):
+        if others and set(others) <= set(full_v):
             parts.append("ALL VLANs")
         else:
             parts.append("VLAN " + compress(full_v))
-    parts += [key_to_text(k) for k in subs]
-    for key in sorted(ported):
-        parts.append("%s %s" % (key_to_text(key), " ".join(sorted(ported[key]))))
-    return "; ".join(parts)
+    parts += subs
+    for k in sorted(ported):
+        parts.append("%s %s" % (code_text(k, subnets), " ".join(sorted(ported[k]))))
+    parts += scoped
+    return "; ".join(parts) or "-"
 
 
-def policy_cells(state, acl, others):
+def policy_cells(state, acl, others, subnets):
     rules = state.rules(acl)
-    den = fmt_rules([(k, pl) for e, kind, k, pl in rules if kind == "DNY"], others)
-    alw = fmt_rules([(k, pl) for e, kind, k, pl in rules if kind == "ALW"], None)
-    extra = len([n for n in state.aces.get(acl, {}).values() if not is_own(n) and not RULE_RE.match(n)])
+    den = fmt_cell(rules, "DNY", others, subnets)
+    alw = fmt_cell(rules, "ALW", None, subnets)
+    extra = []
+    rets = len([r for r in rules if r.kind == "RET"])
+    if rets:
+        extra.append("+%d return" % rets)
+    custom = len([n for n in state.aces.get(acl, {}).values() if not is_own(n) and not parse_rule(0, n)])
+    if custom:
+        extra.append("+%d custom ACE" % custom)
     if extra:
-        alw = (alw + "  " if alw != "-" else "") + "+%d custom ACE" % extra
+        alw = (alw + "  " if alw != "-" else "") + " ".join(extra)
     return den, alw
 
 
@@ -786,7 +994,7 @@ def report(state, subnets, scope, isids):
             if acl is None:
                 out("%-6d %-18s %-30s %s" % (v, cidr(*subnets[v]), "-", "no policy"))
                 continue
-            den, alw = policy_cells(state, acl, [u for u in scope if u != v])
+            den, alw = policy_cells(state, acl, [u for u in scope if u != v], subnets)
             out("%-6d %-18s %-30s %s" % (v, cidr(*subnets[v]), den, alw))
     elif MODE == "PORT":
         ports = sorted(state.port_to_acl.keys(), key=port_sort_key)
@@ -796,7 +1004,7 @@ def report(state, subnets, scope, isids):
         for p in ports:
             acl = state.port_to_acl[p]
             own = [int(n[5:]) for n in state.aces.get(acl, {}).values() if re.match(r"^OWN_V\d+$", n)]
-            den, alw = policy_cells(state, acl, [u for u in scope if u not in own])
+            den, alw = policy_cells(state, acl, [u for u in scope if u not in own], subnets)
             out("%-8s %-6d %-30s %s" % (p, acl, den, alw))
     else:
         out("%-10s %-6s %-18s %-6s %-26s %s" % ("I-SID", "VLAN", "SUBNET", "ACL", "DENIED", "ALLOWED"))
@@ -807,7 +1015,7 @@ def report(state, subnets, scope, isids):
             if acl is None:
                 out("%-10d %-6s %-18s %-6s %-26s %s" % (i, v or "-", sn, "-", "-", "no policy"))
                 continue
-            den, alw = policy_cells(state, acl, [u for u in scope if u != v])
+            den, alw = policy_cells(state, acl, [u for u in scope if u != v], subnets)
             out("%-10d %-6s %-18s %-6d %-26s %s" % (i, v or "-", sn, acl, den, alw))
     out(SUB)
 
@@ -823,8 +1031,8 @@ def set_error():
         pass
 
 
-def build_sources(subnets, scope, isids, excl):
-    """Returns (bindings, dest_exclusions_per_binding)"""
+def build_sources(subnets, scope, isids):
+    """[(Binding, own_vlans)]"""
     res = []
     if MODE == "VLAN":
         src = parse_vlan_list(var(SRC_VAR, ""), "Source VLAN *")
@@ -833,21 +1041,19 @@ def build_sources(subnets, scope, isids, excl):
         if bad:
             raise InputError("Source VLAN %s has no IP interface on this device or is excluded" % compress(bad))
         for v in src:
-            b = Binding("VLAN", v, [("OWN_SUBNET", dest_vlan(v, subnets))],
-                        "VLAN %d  %s" % (v, cidr(*subnets[v])))
-            res.append((b, [v]))
+            res.append((Binding("VLAN", v, [("OWN_SUBNET", net_vlan(v, subnets))],
+                                "VLAN %d  %s" % (v, cidr(*subnets[v]))), [v]))
     elif MODE == "PORT":
         ports = parse_port_list(var(SRC_VAR, ""), "Source Port *")
         pv = parse_vlan_list(var("aclPortVlan", ""), "Port VLAN *", allow_all=False)
         miss = [v for v in pv if v not in subnets]
         if miss:
             raise InputError("Port VLAN %s has no IP interface on this device - use Subnet Override" % compress(miss))
-        own = [("OWN_V%d" % v, dest_vlan(v, subnets)) for v in pv]
+        own = [("OWN_V%d" % v, net_vlan(v, subnets)) for v in pv]
         for p in ports:
             res.append((Binding("PORT", p, own, "Port %s  VLAN %s" % (p, compress(pv))), pv))
     else:
-        txt = var(SRC_VAR, "")
-        lst = parse_num_list(txt, "Source I-SID *", 1, 15999999, True, 200)
+        lst = parse_num_list(var(SRC_VAR, ""), "Source I-SID *", 1, 15999999, True, 200)
         if lst == "ALL":
             lst = sorted([i for i, v in isids.items() if v in scope])
             if not lst:
@@ -856,7 +1062,7 @@ def build_sources(subnets, scope, isids, excl):
             v = isids.get(i)
             own = []
             if v is not None and v in subnets:
-                own = [("OWN_SUBNET", dest_vlan(v, subnets))]
+                own = [("OWN_SUBNET", net_vlan(v, subnets))]
                 title = "I-SID %d  VLAN %d  %s" % (i, v, cidr(*subnets[v]))
             elif v is not None:
                 title = "I-SID %d  VLAN %d  subnet unknown" % (i, v)
@@ -911,14 +1117,24 @@ def main():
         report(state, subnets, scope, isids)
         return
 
-    sources = build_sources(subnets, scope, isids, excl)
+    sources = build_sources(subnets, scope, isids)
+
+    src = None
+    src_txt = var("aclSrcSubnet", "")
+    if src_txt:
+        net, mask = parse_subnet(src_txt, "Source Host/Subnet")
+        src = Net(net, mask)
+        for b, ov in sources:
+            owns = [n for name, n in b.own]
+            if owns and not any(contains(n.nm, src.nm) for n in owns):
+                raise InputError("Source Host/Subnet %s is not inside %s" % (src.label(), b.title))
 
     ports = parse_ports(var("aclPorts", ""))
     sub_txt = var("aclDstSubnet", "")
     dst_txt = var("aclDstVlan", "")
     if sub_txt:
-        net, mask = parse_subnet(sub_txt)
-        fixed, dst_all, dst_list = [dest_subnet(net, mask)], False, None
+        net, mask = parse_subnet(sub_txt, "Destination Subnet")
+        fixed, dst_all, dst_list = [Net(net, mask)], False, None
     elif dst_txt:
         fixed = None
         dl = parse_vlan_list(dst_txt, "Destination VLAN")
@@ -934,23 +1150,24 @@ def main():
             raise InputError("Destination VLAN or Destination Subnet is required for %s" % action)
         fixed, dst_all, dst_list = None, True, None
 
-    if action == "Allow_ACL" and ports != [None] and not sub_txt:
+    if action == "Allow_ACL" and ports != [None] and not sub_txt and not src_txt:
         if not any(p == ("udp", "67") for p in ports):
             out("Note   : udp:67 is not in the port list. If DHCP lives in the destination, "
                 "clients cannot renew leases.")
 
-    planner = Planner(state, subnets)
+    planner = Planner(state, subnets, isids)
     for b, own_vlans in sources:
         if fixed is not None:
             dests = fixed
         elif dst_all:
-            dests = None if action == "Remove_ACL" else [dest_vlan(u, subnets) for u in scope if u not in own_vlans]
+            dests = None if action == "Remove_ACL" else [net_vlan(u, subnets) for u in scope if u not in own_vlans]
         else:
-            dests = [dest_vlan(u, subnets) for u in dst_list if u not in own_vlans]
+            dests = [net_vlan(u, subnets) for u in dst_list if u not in own_vlans]
         if dests is not None and not dests:
             planner.groups.append((b.title, ["Destination equals source - skipped"], []))
             continue
-        planner.add(b, action, dests, ports)
+        planner.add(b, action, src, dests, ports)
+    planner.reconcile_returns()
 
     total = sum([len(g[2]) for g in planner.groups])
     out(SUB)
@@ -961,7 +1178,7 @@ def main():
         for n in notes:
             out("    - " + n)
     out(SUB)
-    out("%d command(s) for %d target(s)" % (total, len(planner.groups)))
+    out("%d command(s)" % total)
 
     if total == 0:
         out("No changes needed. The policy is already in the requested state.")

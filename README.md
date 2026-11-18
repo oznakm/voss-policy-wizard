@@ -21,7 +21,8 @@ All three share the same engine, form layout, actions and rule ordering. Only th
 ## Features
 
 - **Four actions:** `Deny_ACL`, `Allow_ACL`, `Remove_ACL`, `Show_Report`
-- **Flexible targets:** single VLAN, list, range or `ALL`; optional destination subnet or host IP; optional ports (`tcp:443 udp:53 icmp`)
+- **Flexible targets:** single VLAN, list, range or `ALL`; optional source and destination host or subnet; optional ports (`tcp:443 udp:53 icmp`)
+- **Automatic return traffic:** when a port-limited allow is blocked on the way back by a deny on the far side, a reply-only return rule is added there automatically, and removed again when no longer needed
 - **Automatic discovery:** subnets from `show ip interface`, I-SID to VLAN mapping from `show vlan i-sid`
 - **Correct rule ordering by design:** allow rules are always evaluated before deny rules
 - **Idempotent:** existing rules are detected by name and never duplicated; running the same action twice makes no change
@@ -53,6 +54,7 @@ All three share the same engine, form layout, actions and rule ordering. Only th
 | **Action \*** | `Deny_ACL`, `Allow_ACL`, `Remove_ACL` or `Show_Report` |
 | **Source \*** | VLAN wizard: `12`, `12,15`, `20-25` or `ALL`<br>Port wizard: `1/5`, `1/5,1/7` or `1/5-1/8`<br>I-SID wizard: `20030`, `20030,20031` or `ALL` |
 | **Port VLAN \*** | Port wizard only. VLAN of the device on the port. Its subnet is always permitted |
+| Source Host/Subnet | Optional. `10.30.6.100` or `10.30.6.0/25`. Limits the rule to part of the source |
 | Destination VLAN | `13`, `1,2` or `ALL` |
 | Destination Subnet | Optional. `10.10.13.0/24` or a host IP. Overrides Destination VLAN |
 | Ports | Optional. `tcp:443 tcp:3389 udp:53 icmp`. Empty means all traffic |
@@ -72,6 +74,7 @@ All three share the same engine, form layout, actions and rule ordering. Only th
 | Same, but VLAN 1 on HTTPS only | Step 2 with Ports `tcp:443` |
 | Isolate every user VLAN, allow the server VLAN | The two steps above with Source `ALL` |
 | Allow one printer in another VLAN | `Allow_ACL` · Destination Subnet `10.10.13.50` · Ports `tcp:9100` |
+| Allow RDP from one PC to one PC across a deny | `Allow_ACL` · Source `36` · Source Host `10.30.6.100` · Destination Subnet `10.20.8.100` · Ports `tcp:3389`<br>The return rule on the destination VLAN is added automatically |
 
 ### Port wizard
 
@@ -98,8 +101,8 @@ Every ACL uses `default-action permit`. Rules are placed in fixed ACE ranges so 
 | ACE ID | Rule | Purpose |
 |---|---|---|
 | 1-99 | `OWN_...` | Own subnet and gateway, always permitted first |
-| 100-899 | `ALW_...` | Allow rules |
-| 1000-1999 | `DNY_...` | Deny rules |
+| 100-899 | `ALW_` `A_` `R_` | Allow rules and automatic return rules |
+| 1000-1999 | `DNY_` `D_` | Deny rules |
 | default | permit | Everything else, including internet |
 
 Example ACL after *Deny ALL* + *Allow VLAN 1,2*:
@@ -114,9 +117,29 @@ ACE 1002  DNY_V10     deny    VLAN 10
 ACE 1003  DNY_V20     deny    VLAN 20
 ```
 
+### Rule names
+
+| Name | Meaning |
+|---|---|
+| `ALW_V28_TCP443` / `DNY_V28` | Whole source VLAN to VLAN 28 |
+| `A_<src>_<dst>_<port>` / `D_<src>_<dst>` | Rule limited to a source host or subnet |
+| `R_<remote>_<local>_<port>` | Automatic return rule: permits replies from the remote side, source port only |
+
+Hosts and subnets in names are encoded in hex to stay within the 32 character limit of VOSS, e.g. `H0A1E0664` = 10.30.6.100, `N0A1E060018` = 10.30.6.0/24. The report always shows them as normal IP addresses.
+
+### Return traffic
+
+ACLs are stateless. Example: VLAN 28 denies VLAN 36, and you allow `10.30.6.100 → 10.20.8.100 tcp:3389` on VLAN 36. The RDP request passes, but the replies from 10.20.8.100 would be dropped by VLAN 28's deny. The wizard detects this and adds on VLAN 28:
+
+```
+R_H0A140864_H0A1E0664_T3389   permit  src 10.20.8.100  dst 10.30.6.100  tcp src-port 3389
+```
+
+Only replies are permitted; 10.20.8.100 still cannot open new connections to VLAN 36. Return rules are checked on every run, so the order in which you create allows and denies does not matter, and removing the allow also removes its return rule. For allows without ports the wizard does not open the reverse direction; it prints a warning instead.
+
 ## Important notes
 
-- **ACLs are stateless.** A deny from A to B also breaks connections that B starts toward A, because the replies are dropped on A's ingress ACL.
+- **ACLs are stateless.** A deny from A to B also breaks connections that B starts toward A, because the replies are dropped on A's ingress ACL. Port-limited allows get automatic return rules, see above.
 - **A port ACL takes precedence over a VLAN ACL** on the same port. If you use both wizards, a port with an `inPort` ACL is no longer filtered by the `inVlan` ACL of its VLAN.
 - **inVlan in a fabric** is applied where traffic enters the VLAN on a UNI port. Apply the same policy on every gateway / BEB that has hosts in the VLAN.
 - **inVsn with `matchType both`** also filters traffic arriving from the fabric (terminating NNI), so a single policy per BEB covers remote hosts in the same I-SID.

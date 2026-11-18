@@ -1,5 +1,22 @@
 # Changelog
 
+## v4.1 - November 2026
+
+### Added
+- **Source Host/Subnet** field: limit Allow, Deny and Remove to a single host or part of the source, e.g. one PC to one server on RDP.
+- **Automatic return rules:** when a port-limited allow is blocked on the way back by a deny on the destination VLAN, a reply-only rule (`R_...`, source port match) is created there. Return rules are reconciled on every run, so the order of allows and denies does not matter, and they are removed when no longer needed.
+- Warning when an allow without ports would have its replies dropped on the far side.
+- Report shows host-scoped rules and the number of return rules per VLAN.
+
+### Changed
+- New compact rule names for host-scoped and return rules (`A_`, `D_`, `R_` with hex-encoded addresses) to stay within the 32 character VOSS limit.
+
+### Fixed
+- The "no deny rule covers" information is now evaluated before the new allow rule is added.
+
+### Compatible
+- Rule names from v3.0 and v4.0 are unchanged and still recognised.
+
 ## v4.0 - November 2026
 
 ### Added
